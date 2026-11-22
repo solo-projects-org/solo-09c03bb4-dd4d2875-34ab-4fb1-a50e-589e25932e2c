@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>篮球正负值复核</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <header>
+    <h1>篮球正负值复核</h1>
+    <p class="hint">
+      上传换人 / 得分 CSV 与本方首发五人；同节同秒的记录可交错排列。
+      系统给出每人正负值的可达范围，看录像后可登记同秒换人与得分的先后顺序。
+    </p>
+  </header>
+
+  <main>
+    <section class="card">
+      <h2>1. 新建比赛</h2>
+      <form id="upload-form">
+        <label>比赛名称
+          <input name="name" placeholder="例如：第 3 轮 主队 vs 客队" required />
+        </label>
+        <label>本方首发五人（英文逗号分隔）
+          <input name="starters" placeholder="A1,A2,A3,A4,A5" required />
+        </label>
+        <div class="file-row">
+          <label>换人 CSV
+            <input type="file" name="sub_file" accept=".csv" required />
+          </label>
+          <label>得分 CSV
+            <input type="file" name="score_file" accept=".csv" required />
+          </label>
+        </div>
+        <div class="actions">
+          <button type="submit">上传并计算</button>
+          <button type="button" id="load-sample">载入样例数据</button>
+        </div>
+        <p class="hint">
+          表头：换人表 <code>period,remaining,outgoing,incoming</code>；
+          得分表 <code>period,remaining,team,points,scorer</code>（team 取
+          <code>own/opp</code> 或 <code>本方/对方</code>）。
+          <a href="/samples/subs.csv">下载换人样例</a> ·
+          <a href="/samples/scores.csv">下载得分样例</a>
+        </p>
+      </form>
+      <div id="upload-msg" class="msg"></div>
+    </section>
+
+    <section class="card">
+      <h2>2. 已有比赛</h2>
+      <table id="game-table">
+        <thead>
+          <tr><th>ID</th><th>名称</th><th>核实数</th><th>合法顺序数</th><th>状态</th><th>更新时间</th><th></th></tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </section>
+
+    <section class="card hidden" id="detail-card">
+      <h2>3. 比赛详情与复核</h2>
+
+      <h3>比赛进程（按节次、剩余秒数）</h3>
+      <div id="timeline"></div>
+
+      <h3>登记同节同秒的先后核实</h3>
+      <form id="verify-form" class="verify-form">
+        <label>节次 <input type="number" name="period" min="1" required /></label>
+        <label>剩余秒数 <input type="number" name="remaining" min="0" required /></label>
+        <label>先发生 · 表
+          <select name="first_table">
+            <option value="sub">换人表</option>
+            <option value="score">得分表</option>
+          </select>
+        </label>
+        <label>先发生 · 行号 <input type="number" name="first_row" min="1" required /></label>
+        <label>后发生 · 表
+          <select name="second_table">
+            <option value="score">得分表</option>
+            <option value="sub">换人表</option>
+          </select>
+        </label>
+        <label>后发生 · 行号 <input type="number" name="second_row" min="1" required /></label>
+        <label class="grow">备注 <input name="note" placeholder="可选，录像时间点等" /></label>
+        <button type="submit">提交核实并重算</button>
+      </form>
+      <div id="verify-msg" class="msg"></div>
+
+      <h3>已登记核实</h3>
+      <ul id="edge-list"></ul>
+
+      <h3>本方球员正负值范围（在场时本方得分 − 对方得分）</h3>
+      <table id="range-table">
+        <thead>
+          <tr><th>球员</th><th>最小值</th><th>最大值</th><th>是否仍有歧义</th></tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+      <p id="order-summary" class="hint"></p>
+    </section>
+  </main>
+
+  <script src="/app.js"></script>
+</body>
+</html>

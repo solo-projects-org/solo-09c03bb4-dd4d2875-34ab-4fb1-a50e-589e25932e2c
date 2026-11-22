@@ -1,0 +1,17 @@
+services:
+  web:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      PM_DB_PATH: /data/plusminus.db
+    volumes:
+      - pm-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/games')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  pm-data:
