@@ -1,8 +1,16 @@
 """SQLite 持久化层。
 
-并发登记在同一进程内用一把写锁串行化，每次提交都重新读取当时已生效的全部
-核实记录再重算；SQLite 打开 WAL 并对 database is locked 做重试，保证多 worker
-部署时也不会丢提交。
+并发模型（多 worker 进程共用同一个 SQLite 文件）：
+
+* 每次有效核实都在一个 ``BEGIN IMMEDIATE`` 事务里完成「查重 → 插入 → 重读全部
+  已生效核实 → 重算 → 写结果 + 快照」，跨进程串行；WAL 下读者不被写事务阻塞，
+  重算进行期间读到的始终是最近已提交的一版。
+* 重传（已生效核实的重复提交）命中唯一约束，只回读已提交结果，不重算、不写库，
+  因此不会把别的进程刚收窄的结果改回旧值。
+* 详情 / 列表的读取包在单个只读事务里，核实清单、正负值区间与合法顺序数始终
+  来自同一次提交。
+* 旧库可能被历史重传 bug 覆写过 ``results``：``init_db`` 启动时以每场最新
+  快照（最后一条有效核实生效时的结果）为准修复。
 """
 
 from __future__ import annotations
@@ -41,6 +49,26 @@ def connect():
     try:
         with conn:
             yield conn
+    finally:
+        conn.close()
+
+
+@contextmanager
+def read_connect():
+    """只读事务：整批 SELECT 落在同一个已提交快照上。
+
+    WAL 下读事务不阻塞写、也不被写阻塞；事务内的多次读取不会因为别的进程
+    恰好提交而拼出「旧核实清单 + 新结果」这类混搭。
+    """
+    conn = get_conn()
+    try:
+        conn.execute("BEGIN")
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
     finally:
         conn.close()
 
@@ -103,6 +131,62 @@ def init_db() -> None:
             );
             """
         )
+        _repair_results_from_snapshots(conn)
+
+
+def _repair_results_from_snapshots(conn) -> int:
+    """用每场最新快照修复被旧版本重传 bug 覆写的 results 行。
+
+    快照只在「有效核实提交」时写入（含建赛首版），因此每场 id 最大的快照就是
+    最后一条有效核实生效时的结果；results 行若与它不一致，说明曾被重传覆写，
+    按快照恢复。幂等，可随每个 worker 启动重复执行。
+    """
+    rows = conn.execute(
+        """
+        SELECT s.game_id AS game_id, s.feasible AS feasible,
+               s.ranges_json AS ranges_json, s.groups_json AS groups_json,
+               s.total_legal_orders AS total_legal_orders,
+               s.created_at AS created_at,
+               r.feasible AS cur_feasible, r.ranges_json AS cur_ranges,
+               r.groups_json AS cur_groups,
+               r.total_legal_orders AS cur_total
+        FROM result_snapshots s
+        JOIN results r ON r.game_id = s.game_id
+        WHERE s.id = (SELECT MAX(id) FROM result_snapshots
+                      WHERE game_id = s.game_id)
+        """
+    ).fetchall()
+    repaired = 0
+    for row in rows:
+        current = (
+            row["cur_feasible"],
+            row["cur_ranges"],
+            row["cur_groups"],
+            row["cur_total"],
+        )
+        snapshot = (
+            row["feasible"],
+            row["ranges_json"],
+            row["groups_json"],
+            row["total_legal_orders"],
+        )
+        if current != snapshot:
+            _execute_with_retry(
+                conn,
+                "UPDATE results SET feasible=?, ranges_json=?, groups_json=?, "
+                "total_legal_orders=?, infeasible_reason=NULL, updated_at=? "
+                "WHERE game_id=?",
+                (
+                    row["feasible"],
+                    row["ranges_json"],
+                    row["groups_json"],
+                    row["total_legal_orders"],
+                    row["created_at"],
+                    row["game_id"],
+                ),
+            )
+            repaired += 1
+    return repaired
 
 
 # ---------- 事件序列化 ----------
@@ -259,72 +343,89 @@ def add_verification(
 ) -> dict:
     """登记一条核实并重算。
 
-    recompute_fn(starters, subs, scores, edges) 执行引擎计算；抛 InfeasibleError
-    时整个事务回滚，已有核实记录与结果保持不变。返回 {"status", "result",
-    "duplicate"}。
+    整个「查重 → 插入 → 重读全部已生效核实 → 重算 → 写结果 + 快照」放在一个
+    ``BEGIN IMMEDIATE`` 事务里，跨进程串行：
+
+    * 命中唯一约束（同一核实已生效）视为重传：不重算、不写库，只回读已提交
+      结果返回 ``duplicate=True``，因此并发重传不会覆写别人刚收窄的结果；
+      并发登记同一条新核实时也只有一次生效，其余按重传返回。
+    * recompute_fn(starters, subs, scores, edges) 抛 InfeasibleError 时整个
+      事务回滚，已有核实记录与结果保持不变。
+
+    返回 {"status", "result", "duplicate"}。
     """
     with _write_lock, connect() as conn:
+        # 立即拿数据库写锁：本进程外的其他 worker 的核实事务要么先于本事务
+        # 提交（随后可见），要么排在本事务之后，杜绝跨进程交错。
+        _execute_with_retry(conn, "BEGIN IMMEDIATE")
         game = conn.execute(
             "SELECT starters FROM games WHERE id=?", (game_id,)
         ).fetchone()
         if game is None:
             raise KeyError(game_id)
         starters = json.loads(game["starters"])
+
+        cur = _execute_with_retry(
+            conn,
+            "INSERT OR IGNORE INTO verifications (game_id, period, remaining, "
+            "first_table, first_row, second_table, second_row, note) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (
+                game_id,
+                edge.period,
+                edge.remaining,
+                edge.first_table,
+                edge.first_row,
+                edge.second_table,
+                edge.second_row,
+                note,
+            ),
+        )
+        if cur.rowcount == 0:
+            # 重传：只回读已提交结果（同一事务内，必然与已生效核实清单对应）。
+            row = conn.execute(
+                "SELECT * FROM results WHERE game_id=?", (game_id,)
+            ).fetchone()
+            if row is not None:
+                return {
+                    "status": "ok",
+                    "result": _row_to_result(row),
+                    "duplicate": True,
+                }
+            # 防御性兜底：建赛时一定会写首版结果，正常不会走到这里。
+            result = recompute_fn(
+                starters,
+                load_subs(conn, game_id),
+                load_scores(conn, game_id),
+                load_edges(conn, game_id),
+            )
+            return {"status": "ok", "result": result, "duplicate": True}
+
+        # 新核实：重新读取提交时已生效的全部核实（含本次插入）再计算。
         subs = load_subs(conn, game_id)
         scores = load_scores(conn, game_id)
-
-        existing = {
-            (
-                r["period"],
-                r["remaining"],
-                r["first_table"],
-                r["first_row"],
-                r["second_table"],
-                r["second_row"],
-            )
-            for r in conn.execute(
-                "SELECT period, remaining, first_table, first_row, "
-                "second_table, second_row FROM verifications WHERE game_id=?",
-                (game_id,),
-            )
-        }
-        edge_key = (
-            edge.period,
-            edge.remaining,
-            edge.first_table,
-            edge.first_row,
-            edge.second_table,
-            edge.second_row,
-        )
-        duplicate = edge_key in existing
-        if not duplicate:
-            # 同一对事件的反向约束已经存在 -> 必然冲突，交由引擎给出统一报错。
-            _execute_with_retry(
-                conn,
-                "INSERT INTO verifications (game_id, period, remaining, "
-                "first_table, first_row, second_table, second_row, note) "
-                "VALUES (?,?,?,?,?,?,?,?)",
-                (
-                    game_id,
-                    edge.period,
-                    edge.remaining,
-                    edge.first_table,
-                    edge.first_row,
-                    edge.second_table,
-                    edge.second_row,
-                    note,
-                ),
-            )
-
-        # 重新读取提交时已生效的全部核实（含本次插入）再计算。
         edges = load_edges(conn, game_id)
         # recompute 抛异常时 connect() 上下文会自动回滚，已有记录与结果不变。
         result = recompute_fn(starters, subs, scores, edges)
-        _persist_result(conn, game_id, result, snapshot=not duplicate)
-        return {"status": "ok", "result": result, "duplicate": duplicate}
+        _persist_result(conn, game_id, result)
+        return {"status": "ok", "result": result, "duplicate": False}
 
 
-def _persist_result(conn, game_id: int, result: dict, snapshot: bool = True) -> None:
+def _row_to_result(row: sqlite3.Row) -> dict:
+    """把 results 行还原成 compute() 返回形状的字典（groups 为 dict 列表）。"""
+    ranges = json.loads(row["ranges_json"])
+    return {
+        "feasible": bool(row["feasible"]),
+        "ranges": ranges,
+        "groups": json.loads(row["groups_json"]),
+        "total_legal_orders": row["total_legal_orders"],
+        "players": sorted(ranges),
+        "infeasible_reason": row["infeasible_reason"],
+    }
+
+
+def _persist_result(conn, game_id: int, result: dict) -> None:
+    """写入最新结果并留快照；只在有效核实（或建赛）的事务里调用。"""
     feasible = 1 if result.get("feasible") else 0
     ranges = json.dumps(result.get("ranges", {}), ensure_ascii=False)
     groups = json.dumps(
@@ -345,21 +446,20 @@ def _persist_result(conn, game_id: int, result: dict, snapshot: bool = True) -> 
         "updated_at=datetime('now')",
         (game_id, feasible, ranges, groups, total, reason),
     )
-    if snapshot:
-        count = conn.execute(
-            "SELECT COUNT(*) AS c FROM verifications WHERE game_id=?", (game_id,)
-        ).fetchone()["c"]
-        _execute_with_retry(
-            conn,
-            "INSERT INTO result_snapshots (game_id, feasible, ranges_json, "
-            "groups_json, total_legal_orders, verification_count) "
-            "VALUES (?,?,?,?,?,?)",
-            (game_id, feasible, ranges, groups, total, count),
-        )
+    count = conn.execute(
+        "SELECT COUNT(*) AS c FROM verifications WHERE game_id=?", (game_id,)
+    ).fetchone()["c"]
+    _execute_with_retry(
+        conn,
+        "INSERT INTO result_snapshots (game_id, feasible, ranges_json, "
+        "groups_json, total_legal_orders, verification_count) "
+        "VALUES (?,?,?,?,?,?)",
+        (game_id, feasible, ranges, groups, total, count),
+    )
 
 
 def list_games() -> list[sqlite3.Row]:
-    with connect() as conn:
+    with read_connect() as conn:
         return conn.execute(
             "SELECT g.id, g.name, g.created_at, r.feasible, "
             "r.total_legal_orders, r.updated_at, "
@@ -371,7 +471,8 @@ def list_games() -> list[sqlite3.Row]:
 
 
 def get_game_detail(game_id: int) -> Optional[dict]:
-    with connect() as conn:
+    # 单个只读事务：核实清单与结果行来自同一次提交，不会读到混搭版本。
+    with read_connect() as conn:
         game = conn.execute("SELECT * FROM games WHERE id=?", (game_id,)).fetchone()
         if game is None:
             return None

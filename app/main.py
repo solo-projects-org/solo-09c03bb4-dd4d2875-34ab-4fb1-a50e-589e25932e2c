@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import asdict
+from dataclasses import asdict, is_dataclass
 
 from contextlib import asynccontextmanager
 
@@ -112,12 +112,16 @@ async def create_game(
 
 
 def _public_result(result: dict) -> dict:
+    # groups 可能是引擎返回的 GroupInfo（新算的），也可能是库里回读的 dict。
+    groups = [
+        asdict(g) if is_dataclass(g) else g for g in result["groups"]
+    ]
     return {
         "feasible": result["feasible"],
         "ranges": result["ranges"],
-        "groups": [asdict(g) for g in result["groups"]],
+        "groups": groups,
         "total_legal_orders": result["total_legal_orders"],
-        "players": result["players"],
+        "players": result.get("players") or sorted(result["ranges"]),
     }
 
 

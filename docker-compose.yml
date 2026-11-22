@@ -1,6 +1,9 @@
 services:
   web:
     build: .
+    # 两个工作进程共用卷里的同一个 SQLite 文件（WAL），验证多进程并发核实。
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000",
+              "--workers", "2"]
     ports:
       - "8000:8000"
     environment:
